@@ -497,12 +497,12 @@ def extract_vision_info(conversations: Union[List[Dict[str, Any]], List[List[Dic
                         vision_infos.append(ele)
     return vision_infos
 
-
+# NOTE(zhouenshen): Default setting is adapted for Qwen3VL
 def process_vision_info(
     conversations: Union[List[Dict[str, Any]], List[List[Dict[str, Any]]]],
-    return_video_kwargs: bool = False,
-    return_video_metadata: bool = False,
-    image_patch_size: int = 14,
+    return_video_kwargs: bool = True, # False,
+    return_video_metadata: bool = True, # False,
+    image_patch_size: int = 16, # 14,
 ) -> Tuple[Optional[List[Image.Image]], Optional[List[Union[torch.Tensor, List[Image.Image]]]], Optional[Dict[str, Any]]]:
 
     vision_infos = extract_vision_info(conversations)
