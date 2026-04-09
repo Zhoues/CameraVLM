@@ -23,6 +23,16 @@ IMAGE_TOKEN_INDEX = 151655
 VIDEO_TOKEN_INDEX = 151656
 DEFAULT_IMAGE_TOKEN = "<image>"
 DEFAULT_VIDEO_TOKEN = "<video>"
+DATASET_META_KEY = "_dataset_meta"
+DATASET_META_DEFAULTS = {
+    "message_key": "conversations",
+    "image_key": "image",
+    "video_key": "video",
+    "role_key": "from",
+    "content_key": "value",
+    "user_tag": "human",
+    "assistant_tag": "gpt",
+}
 
 local_rank = None
 
@@ -39,6 +49,54 @@ def read_jsonl(path):
 
 def _make_abs_paths(base: Path, files: str) -> str:
     return f"{(base / files).resolve()}"
+
+
+def _normalize_media_files(files):
+    if files is None:
+        return []
+    if isinstance(files, str):
+        return [files]
+    if isinstance(files, Sequence) and not isinstance(files, (str, bytes)):
+        return [media for media in files if media]
+    return [files]
+
+
+def _normalize_role(role, user_tag, assistant_tag):
+    if role in {user_tag, "human", "user"}:
+        return "user"
+    if role in {assistant_tag, "gpt", "assistant"}:
+        return "assistant"
+    raise ValueError(f"Unsupported conversation role: {role}")
+
+
+def _normalize_text_content(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        text_chunks = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                text_chunks.append(part.get("text", ""))
+            elif isinstance(part, str):
+                text_chunks.append(part)
+        return "".join(text_chunks)
+    return str(content)
+
+
+def _get_dataset_meta(item):
+    meta = item.get(DATASET_META_KEY, {})
+    if not isinstance(meta, dict):
+        meta = {}
+    return {**DATASET_META_DEFAULTS, **meta}
+
+
+def _attach_dataset_meta(sample, data):
+    sample["data_path"] = data["data_path"]
+    sample[DATASET_META_KEY] = {
+        key: data[key]
+        for key in DATASET_META_DEFAULTS
+        if key in data and data[key] != DATASET_META_DEFAULTS[key]
+    }
 
 
 def update_processor_pixels(processor, data_args):
@@ -138,14 +196,31 @@ def update_processor_pixels(processor, data_args):
 
 
 def _build_messages(item: Dict[str, Any], base_path: Path) -> List[Dict[str, Any]]:
-    # Extract and normalize images and videos
-    images = item.get("image") or []
-    if isinstance(images, str):
-        images = [images]
+    meta = _get_dataset_meta(item)
+    message_key = meta["message_key"]
+    image_key = meta["image_key"]
+    video_key = meta["video_key"]
+    role_key = meta["role_key"]
+    content_key = meta["content_key"]
+    user_tag = meta["user_tag"]
+    assistant_tag = meta["assistant_tag"]
 
-    videos = item.get("video") or []
-    if isinstance(videos, str):
-        videos = [videos]
+    messages_raw = item.get(message_key)
+    if messages_raw is None:
+        messages_raw = item.get("conversations", item.get("messages"))
+    if messages_raw is None:
+        raise KeyError(f"Cannot find conversation field in sample: {item.keys()}")
+
+    # Extract and normalize images and videos
+    images = item.get(image_key)
+    if images is None:
+        images = item.get("images", item.get("image"))
+    images = _normalize_media_files(images)
+
+    videos = item.get(video_key)
+    if videos is None:
+        videos = item.get("videos", item.get("video"))
+    videos = _normalize_media_files(videos)
 
     # Build media pools with absolute paths
     image_pool = [
@@ -156,9 +231,9 @@ def _build_messages(item: Dict[str, Any], base_path: Path) -> List[Dict[str, Any
     ]
 
     messages = []
-    for turn in item["conversations"]:
-        role = "user" if turn["from"] == "human" else "assistant"
-        text: str = turn["value"]
+    for turn in messages_raw:
+        role = _normalize_role(turn[role_key], user_tag, assistant_tag)
+        text = _normalize_text_content(turn[content_key])
 
         if role == "user":
             content = []
@@ -285,9 +360,9 @@ class LazySupervisedDataset(Dataset):
             for ann in annotations:
                 if isinstance(ann, list):
                     for sub_ann in ann:
-                        sub_ann["data_path"] = data["data_path"]
+                        _attach_dataset_meta(sub_ann, data)
                 else:
-                    ann["data_path"] = data["data_path"]
+                    _attach_dataset_meta(ann, data)
             list_data_dict += annotations
 
         rank0_print(f"Total training samples: {len(list_data_dict)}")
