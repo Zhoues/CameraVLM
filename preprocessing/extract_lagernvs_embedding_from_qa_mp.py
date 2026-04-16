@@ -2,7 +2,13 @@
 /share/project/zhouenshen/miniconda3/envs/anno/bin/python \
 /share/project/zhouenshen/hpfs/code/ActivePerception/CameraVLM/preprocessing/extract_lagernvs_embedding_from_qa_mp.py \
   --dataset_name hstar_sft_512x384_fov_90 \
-  --gpus 0,1,2,3 \
+  --gpus 0,1 \
+  --workers_per_gpu 8
+
+/share/project/zhouenshen/miniconda3/envs/anno/bin/python \
+/share/project/zhouenshen/hpfs/code/ActivePerception/CameraVLM/preprocessing/extract_lagernvs_embedding_from_qa_mp.py \
+  --dataset_name hstar_sft_ours_512x384_fov_90 \
+  --gpus 0,1 \
   --workers_per_gpu 8
 
 /share/project/zhouenshen/miniconda3/envs/anno/bin/python \
@@ -16,19 +22,6 @@
   --dataset_name raw_pano_512x384_fov_90 \
   --gpus 0,1,2,3,4,5,6,7 \
   --workers_per_gpu 8
-
-/share/project/zhouenshen/miniconda3/envs/anno/bin/python \
-/share/project/zhouenshen/hpfs/code/ActivePerception/CameraVLM/preprocessing/extract_lagernvs_embedding_from_qa_mp.py \
-  --dataset_name PAP_retrieval_512x384_fov_90 \
-  --gpus 0,1,2,3 \
-  --workers_per_gpu 6
-
-
-/share/project/zhouenshen/miniconda3/envs/anno/bin/python \
-/share/project/zhouenshen/hpfs/code/ActivePerception/CameraVLM/preprocessing/extract_lagernvs_embedding_from_qa_mp.py \
-  --dataset_name PAP_retrieval_512x384_fov_90 \
-  --gpus 0,1,2,3,4,5,6,7 \
-  --workers_per_gpu 6
 
 """
 

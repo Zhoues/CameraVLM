@@ -10,7 +10,7 @@ TORCHRUN_BIN="${TORCHRUN_BIN:-/share/project/lmz/miniconda3/envs/llamafactory/bi
 cd "${PROJECT_ROOT}"
 
 # Run name
-run_name="qwen3vl_2b_ap_all_data_2_nodes_gas_2"
+run_name="activeqwen3vl_2b_2_nodes_gas_4_camera+visual_search+general"
 # Output configuration
 output_dir=${PROJECT_ROOT}/output/${run_name}
 mkdir -p ${output_dir}
@@ -57,7 +57,7 @@ NNODES=${WORLD_SIZE:-1}
 # Training hyperparameters
 lr=2e-5
 batch_size=13
-grad_accum_steps=2
+grad_accum_steps=4
 num_train_epochs=1
 image_max_pixels=262144
 image_min_pixels=1024
@@ -68,31 +68,62 @@ save_steps=3000
 logging_steps=1
 warmup_ratio=0.03
 
+# ActiveQwen configuration
+active_mlp_lr=${ACTIVE_MLP_LR:-1e-3}
+active_latent_token_count=${ACTIVE_LATENT_TOKEN_COUNT:-12}
+active_prompt_length=${ACTIVE_PROMPT_LENGTH:-64}
+active_projector_depth=${ACTIVE_PROJECTOR_DEPTH:-2}
+active_target_dim=${ACTIVE_TARGET_DIM:-768}
+active_projector_tunable=${TUNE_ACTIVE_PROJECTOR:-True}
+active_ce_loss_weight=${ACTIVE_CE_LOSS_WEIGHT:-1.0}
+active_3d_loss_weight=${ACTIVE_3D_LOSS_WEIGHT:-0.5}
+
 dataset_names=(
     ca1m_referring_512x384_fov_90
     ca1m_vacant_512x384_fov_90
 
     pap_512x384_fov_90
+    pap_512x384_fov_90_latent
     pap_multi_step_512x384_fov_90
     pap_filter_512x384_fov_90
+    pap_filter_vqa_512x384_fov_90
     pap_retrieval_512x384_fov_90
 
     raw_pano_512x384_fov_90
+    raw_pano_512x384_fov_90_latent
     raw_pano_multi_step_512x384_fov_90
     raw_pano_filter_512x384_fov_90
+    raw_pano_filter_vqa_512x384_fov_90
     raw_pano_retrieval_512x384_fov_90
 
     # hstar_bench_512x384_fov_90
     hstar_sft_512x384_fov_90
     hstar_sft_512x384_fov_90
-    hstar_sft_512x384_fov_90
+    hstar_sft_512x384_fov_90_latent
+    hstar_sft_512x384_fov_90_latent
 
     hstar_sft_ours_512x384_fov_90
     hstar_sft_ours_512x384_fov_90
+    hstar_sft_ours_512x384_fov_90_latent
+    hstar_sft_ours_512x384_fov_90_latent
     hstar_sft_ours_filter_512x384_fov_90
+    hstar_sft_ours_filter_vqa_512x384_fov_90
     hstar_sft_ours_retrieval_512x384_fov_90
-    # vsi_590k
-    # libero_fast_vlm
+
+    deepeyes_train
+    deepeyes_train_org
+    deepeyes_rl
+    deepeyes_rl_org
+
+    deepeyes_rl_vstar
+    deepeyes_rl_vstar_org
+    deepeyes_rl_vstar
+    deepeyes_rl_vstar_org
+    deepeyes_rl_vstar
+    deepeyes_rl_vstar_org
+    visualprobe_train
+    
+    llava_onevision_1_5
 )
 datasets=$(IFS=,; echo "${dataset_names[*]}")
 
@@ -107,8 +138,16 @@ ${TORCHRUN_BIN} --nproc_per_node=${NPROC_PER_NODE} \
                 --dataset_use ${datasets} \
                 --data_flatten True \
                 --tune_mm_vision False \
-                --tune_mm_mlp True \
+                --tune_mm_mlp False \
                 --tune_mm_llm True \
+                --tune_active_projector True \
+                --activeqwen_enable True \
+                --activeqwen_latent_token_count ${active_latent_token_count} \
+                --activeqwen_projector_prompt_length ${active_prompt_length} \
+                --activeqwen_projector_depth ${active_projector_depth} \
+                --activeqwen_target_dim ${active_target_dim} \
+                --active_ce_loss_weight ${active_ce_loss_weight} \
+                --active_3d_loss_weight ${active_3d_loss_weight} \
                 --bf16 \
                 --output_dir ${output_dir} \
                 --num_train_epochs ${num_train_epochs} \
@@ -123,6 +162,8 @@ ${TORCHRUN_BIN} --nproc_per_node=${NPROC_PER_NODE} \
                 --save_steps ${save_steps} \
                 --save_total_limit 1 \
                 --learning_rate ${lr} \
+                --mm_projector_lr ${lr} \
+                --active_projector_lr ${active_mlp_lr} \
                 --weight_decay 0 \
                 --warmup_ratio ${warmup_ratio} \
                 --max_grad_norm 1 \

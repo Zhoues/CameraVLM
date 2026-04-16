@@ -17,6 +17,11 @@ import transformers
 
 from . import data_list
 from .rope2d import get_rope_index_25, get_rope_index_2, get_rope_index_3
+from qwenvl.active import (
+    inject_spatial_placeholder,
+    load_active_embedding,
+    replace_spatial_placeholder,
+)
 
 IGNORE_INDEX = -100
 IMAGE_TOKEN_INDEX = 151655
@@ -38,13 +43,22 @@ local_rank = None
 
 
 def rank0_print(*args):
-    if local_rank == 0:
+    if local_rank in (None, -1, 0):
         print(*args)
+
+
+def rank0_print_json(title: str, payload: Dict[str, Any]) -> None:
+    rank0_print(f"=== {title} ===")
+    rank0_print(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 def read_jsonl(path):
     with open(path, "r") as f:
         return [json.loads(line) for line in f]
+
+
+def count_effective_qas(annotations):
+    return sum(len(annotation) if isinstance(annotation, list) else 1 for annotation in annotations)
 
 
 def _make_abs_paths(base: Path, files: str) -> str:
@@ -92,6 +106,9 @@ def _get_dataset_meta(item):
 
 def _attach_dataset_meta(sample, data):
     sample["data_path"] = data["data_path"]
+    for extra_key in ("provide_latent", "latent_path", "latent_field"):
+        if extra_key in data:
+            sample[extra_key] = data[extra_key]
     sample[DATASET_META_KEY] = {
         key: data[key]
         for key in DATASET_META_DEFAULTS
@@ -100,102 +117,96 @@ def _attach_dataset_meta(sample, data):
 
 
 def update_processor_pixels(processor, data_args):
-    logger = logging.getLogger(__name__)
+    def summarize_processor(module, keys):
+        summary = {key: getattr(module, key, None) for key in keys}
+        size = getattr(module, "size", None)
+        if isinstance(size, dict):
+            summary["size"] = {
+                "shortest_edge": size.get("shortest_edge"),
+                "longest_edge": size.get("longest_edge"),
+            }
+        elif size is not None:
+            summary["size"] = size
+        return summary
 
     # --- Image Processor ---
     ip = processor.image_processor
-    rank0_print("=== BEFORE IMAGE PROCESSOR PARAMETERS ===")
-    rank0_print(f"Image min_pixels: {getattr(ip, 'min_pixels', 'N/A')}")
-    rank0_print(f"Image max_pixels: {getattr(ip, 'max_pixels', 'N/A')}")
-    rank0_print(f"ip.size: {ip.size}")
-    rank0_print(f"Image size (shortest_edge): {ip.size.get('shortest_edge', 'N/A')}")
-    rank0_print(f"Image size (longest_edge):  {ip.size.get('longest_edge', 'N/A')}")
+    processor_summary = {
+        "image_processor": {
+            "before": summarize_processor(ip, ("min_pixels", "max_pixels")),
+        }
+    }
 
     if hasattr(ip, "min_pixels") and hasattr(ip, "max_pixels"):
         ip.min_pixels = data_args.min_pixels
         ip.max_pixels = data_args.max_pixels
-        rank0_print(f"✅ Updated image_processor min_pixels to {data_args.min_pixels}")
-        rank0_print(f"✅ Updated image_processor max_pixels to {data_args.max_pixels}")
 
     if hasattr(ip, "size") and isinstance(ip.size, dict):
         ip.size["shortest_edge"] = data_args.min_pixels
         ip.size["longest_edge"] = data_args.max_pixels
-        rank0_print(
-            f"✅ Updated image_processor size['shortest_edge'] to {data_args.min_pixels}"
-        )
-        rank0_print(
-            f"✅ Updated image_processor size['longest_edge'] to {data_args.max_pixels}"
-        )
 
-    rank0_print("=== AFTER IMAGE PROCESSOR PARAMETERS ===")
-    rank0_print(f"Image min_pixels: {getattr(ip, 'min_pixels', 'N/A')}")
-    rank0_print(f"Image max_pixels: {getattr(ip, 'max_pixels', 'N/A')}")
-    rank0_print(f"Image size (shortest_edge): {ip.size.get('shortest_edge', 'N/A')}")
-    rank0_print(f"Image size (longest_edge):  {ip.size.get('longest_edge', 'N/A')}")
+    processor_summary["image_processor"]["after"] = summarize_processor(
+        ip,
+        ("min_pixels", "max_pixels"),
+    )
 
     # --- Video Processor ---
     if hasattr(processor, "video_processor") and processor.video_processor is not None:
         vp = processor.video_processor
-        rank0_print("\n=== BEFORE VIDEO PROCESSOR PARAMETERS ===")
-        rank0_print(f"Video min_pixels: {getattr(vp, 'min_pixels', 'N/A')}")
-        rank0_print(f"Video max_pixels: {getattr(vp, 'max_pixels', 'N/A')}")
-        rank0_print(f"Video min_frames: {getattr(vp, 'min_frames', 'N/A')}")
-        rank0_print(f"Video max_frames: {getattr(vp, 'max_frames', 'N/A')}")
-        rank0_print(f"Video fps: {getattr(vp, 'fps', 'N/A')}")
-        rank0_print(
-            f"Video size (shortest_edge): {vp.size.get('shortest_edge', 'N/A')}"
-        )
-        rank0_print(f"Video size (longest_edge):  {vp.size.get('longest_edge', 'N/A')}")
+        processor_summary["video_processor"] = {
+            "before": summarize_processor(
+                vp,
+                ("min_pixels", "max_pixels", "min_frames", "max_frames", "fps"),
+            )
+        }
 
         if hasattr(vp, "min_pixels") and hasattr(vp, "max_pixels"):
             vp.min_pixels = data_args.video_min_pixels
             vp.max_pixels = data_args.video_max_pixels
-            rank0_print(
-                f"✅ Updated Qwen2-VL video_processor min_pixels to {data_args.video_min_pixels}"
-            )
-            rank0_print(
-                f"✅ Updated Qwen2-VL video_processor max_pixels to {data_args.video_max_pixels}"
-            )
 
         if hasattr(vp, "min_frames") and hasattr(vp, "max_frames"):
             vp.min_frames = data_args.video_min_frames
             vp.max_frames = data_args.video_max_frames
-            rank0_print(
-                f"✅ Updated video_processor min_frames to {data_args.video_min_frames}"
-            )
-            rank0_print(
-                f"✅ Updated video_processor max_frames to {data_args.video_max_frames}"
-            )
 
         if hasattr(vp, "fps"):
             vp.fps = data_args.video_fps
-            rank0_print(f"✅ Updated video_processor fps to {data_args.video_fps}")
 
         if hasattr(vp, "size") and isinstance(vp.size, dict):
             vp.size["shortest_edge"] = data_args.video_min_pixels
             vp.size["longest_edge"] = data_args.video_max_pixels
-            rank0_print(
-                f"✅ Updated Video size (shortest_edge): {vp.size.get('shortest_edge', 'N/A')}"
-            )
-            rank0_print(
-                f"✅ Updated Video size (longest_edge):  {vp.size.get('longest_edge', 'N/A')}"
-            )
 
-        rank0_print("=== AFTER VIDEO PROCESSOR PARAMETERS ===")
-        rank0_print(f"Video min_pixels: {getattr(vp, 'min_pixels', 'N/A')}")
-        rank0_print(f"Video max_pixels: {getattr(vp, 'max_pixels', 'N/A')}")
-        rank0_print(f"Video min_frames: {getattr(vp, 'min_frames', 'N/A')}")
-        rank0_print(f"Video max_frames: {getattr(vp, 'max_frames', 'N/A')}")
-        rank0_print(f"Video fps: {getattr(vp, 'fps', 'N/A')}")
-        rank0_print(
-            f"Video size (shortest_edge): {vp.size.get('shortest_edge', 'N/A')}"
+        processor_summary["video_processor"]["after"] = summarize_processor(
+            vp,
+            ("min_pixels", "max_pixels", "min_frames", "max_frames", "fps"),
         )
-        rank0_print(f"Video size (longest_edge):  {vp.size.get('longest_edge', 'N/A')}")
+
+    rank0_print_json("Processor Config", processor_summary)
 
     return processor
 
 
-def _build_messages(item: Dict[str, Any], base_path: Path) -> List[Dict[str, Any]]:
+def _prepare_assistant_text(
+    item: Dict[str, Any],
+    text: str,
+    activeqwen_enable: bool,
+    activeqwen_latent_token_count: int,
+) -> str:
+    if not item.get("provide_latent", False):
+        return text
+    if not activeqwen_enable:
+        raise ValueError("Dataset with latent supervision requires --activeqwen_enable True")
+    return replace_spatial_placeholder(
+        inject_spatial_placeholder(text),
+        activeqwen_latent_token_count,
+    )
+
+
+def _build_messages(
+    item: Dict[str, Any],
+    base_path: Path,
+    activeqwen_enable: bool = False,
+    activeqwen_latent_token_count: int = 12,
+) -> List[Dict[str, Any]]:
     meta = _get_dataset_meta(item)
     message_key = meta["message_key"]
     image_key = meta["image_key"]
@@ -259,6 +270,12 @@ def _build_messages(item: Dict[str, Any], base_path: Path) -> List[Dict[str, Any
             messages.append({"role": role, "content": content})
         else:
             # Assistant messages contain only text
+            text = _prepare_assistant_text(
+                item,
+                text,
+                activeqwen_enable=activeqwen_enable,
+                activeqwen_latent_token_count=activeqwen_latent_token_count,
+            )
             messages.append({"role": role, "content": [{"type": "text", "text": text}]})
 
     # Check for unused media files
@@ -277,13 +294,20 @@ def _build_messages(item: Dict[str, Any], base_path: Path) -> List[Dict[str, Any
 def preprocess_qwen_visual(
     sources,
     processor,
+    activeqwen_enable: bool = False,
+    activeqwen_latent_token_count: int = 12,
 ) -> Dict:
     if len(sources) != 1:
         raise ValueError(f"Expected 1 source, got {len(sources)}")
 
     source = sources[0]
     base_path = Path(source.get("data_path", ""))
-    messages = _build_messages(source, base_path)
+    messages = _build_messages(
+        source,
+        base_path,
+        activeqwen_enable=activeqwen_enable,
+        activeqwen_latent_token_count=activeqwen_latent_token_count,
+    )
 
     full_result = processor.apply_chat_template(
         messages, tokenize=True, return_dict=True, return_tensors="pt"
@@ -316,15 +340,100 @@ def preprocess_qwen_visual(
     return full_result
 
 
+def _collate_active_targets(target_tensors: List[torch.Tensor]):
+    if not target_tensors:
+        return None, None
+
+    max_views = max(target.shape[0] for target in target_tensors)
+    max_tokens = max(target.shape[1] for target in target_tensors)
+    target_dim = target_tensors[0].shape[2]
+    dtype = target_tensors[0].dtype
+
+    batch_targets = torch.zeros(
+        len(target_tensors),
+        max_views,
+        max_tokens,
+        target_dim,
+        dtype=dtype,
+    )
+    batch_view_mask = torch.zeros(len(target_tensors), max_views, dtype=torch.bool)
+
+    for batch_idx, target in enumerate(target_tensors):
+        view_count, token_count = target.shape[:2]
+        batch_targets[batch_idx, :view_count, :token_count] = target
+        batch_view_mask[batch_idx, :view_count] = True
+
+    return batch_targets, batch_view_mask
+
+
+def _append_active_fields_to_batch(
+    batch: Dict[str, torch.Tensor],
+    instances: Sequence[Dict],
+    flattened: bool,
+) -> Dict[str, torch.Tensor]:
+    sample_image_counts = torch.tensor(
+        [int(instance.get("active_sample_image_count", 0)) for instance in instances],
+        dtype=torch.long,
+    )
+    sample_has_label = torch.tensor(
+        [bool(instance.get("active_sample_has_label", False)) for instance in instances],
+        dtype=torch.bool,
+    )
+
+    if flattened:
+        active_masks = [
+            instance.get(
+                "active_token_mask",
+                torch.zeros_like(instance["input_ids"], dtype=torch.bool),
+            )
+            for instance in instances
+        ]
+        active_token_mask = torch.cat(active_masks, dim=1)
+        sample_latent_counts = torch.tensor(
+            [int(mask.sum().item()) for mask in active_masks],
+            dtype=torch.long,
+        )
+    else:
+        active_masks = [
+            instance.get(
+                "active_token_mask",
+                torch.zeros_like(instance["input_ids"], dtype=torch.bool),
+            ).squeeze(0)
+            for instance in instances
+        ]
+        active_token_mask = torch.nn.utils.rnn.pad_sequence(
+            active_masks,
+            batch_first=True,
+            padding_value=False,
+        )
+        active_token_mask = active_token_mask[:, : batch["input_ids"].shape[1]]
+        sample_latent_counts = active_token_mask.long().sum(dim=1)
+
+    batch["active_token_mask"] = active_token_mask
+    batch["active_sample_has_label"] = sample_has_label
+    batch["active_sample_image_counts"] = sample_image_counts
+    batch["active_sample_latent_counts"] = sample_latent_counts
+
+    active_targets = [
+        instance["active_target_embeddings"]
+        for instance in instances
+        if bool(instance.get("active_sample_has_label", False))
+        and "active_target_embeddings" in instance
+    ]
+    active_target_embeddings, active_target_view_mask = _collate_active_targets(active_targets)
+    batch["active_target_embeddings"] = active_target_embeddings
+    batch["active_target_view_mask"] = active_target_view_mask
+    return batch
+
+
 class LazySupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
 
     def __init__(self, processor, data_args):
         super(LazySupervisedDataset, self).__init__()
 
-        dataset = data_args.dataset_use.split(",")
+        dataset = [dataset_name.strip() for dataset_name in data_args.dataset_use.split(",") if dataset_name.strip()]
         dataset_list = data_list(dataset)
-        rank0_print(f"Loading datasets: {dataset_list}")
         self.video_max_total_pixels = getattr(
             data_args, "video_max_total_pixels", 1664 * 28 * 28
         )
@@ -342,21 +451,39 @@ class LazySupervisedDataset(Dataset):
             raise ValueError(f"model_type: {data_args.model_type} not supported")
 
         list_data_dict = []
+        dataset_statistics = []
+        total_record_count = 0
+        total_qa_count = 0
 
-        for data in dataset_list:
+        for dataset_name, data in zip(dataset, dataset_list):
             file_format = data["annotation_path"].split(".")[-1]
             if file_format == "jsonl":
                 annotations = read_jsonl(data["annotation_path"])
             else:
                 annotations = json.load(open(data["annotation_path"], "r"))
+            original_record_count = len(annotations)
+            original_qa_count = count_effective_qas(annotations)
             sampling_rate = data.get("sampling_rate", 1.0)
             if sampling_rate < 1.0:
                 annotations = random.sample(
                     annotations, int(len(annotations) * sampling_rate)
                 )
-                rank0_print(f"sampling {len(annotations)} examples from dataset {data}")
-            else:
-                rank0_print(f"dataset name: {data}")
+            sampled_record_count = len(annotations)
+            sampled_qa_count = count_effective_qas(annotations)
+            dataset_statistics.append(
+                {
+                    "dataset_name": dataset_name,
+                    "annotation_path": data["annotation_path"],
+                    "sampling_rate": sampling_rate,
+                    "provide_latent": bool(data.get("provide_latent", False)),
+                    "original_record_count": original_record_count,
+                    "original_qa_count": original_qa_count,
+                    "record_count": sampled_record_count,
+                    "qa_count": sampled_qa_count,
+                }
+            )
+            total_record_count += sampled_record_count
+            total_qa_count += sampled_qa_count
             for ann in annotations:
                 if isinstance(ann, list):
                     for sub_ann in ann:
@@ -365,10 +492,10 @@ class LazySupervisedDataset(Dataset):
                     _attach_dataset_meta(ann, data)
             list_data_dict += annotations
 
-        rank0_print(f"Total training samples: {len(list_data_dict)}")
+        self.dataset_statistics = dataset_statistics
+        self.total_record_count = total_record_count
+        self.total_qa_count = total_qa_count
 
-
-        rank0_print("Formatting inputs...Skip in lazy mode")
         processor = update_processor_pixels(processor, data_args)
         self.processor = processor
         self.tokenizer = processor.tokenizer
@@ -465,7 +592,14 @@ class LazySupervisedDataset(Dataset):
         data_dict = preprocess_qwen_visual(
             sources,
             self.processor,
+            activeqwen_enable=getattr(self.data_args, "activeqwen_enable", False),
+            activeqwen_latent_token_count=getattr(
+                self.data_args,
+                "activeqwen_latent_token_count",
+                12,
+            ),
         )
+        source = sources[0]
 
         seq_len = data_dict["input_ids"][0].size(0)
 
@@ -500,25 +634,43 @@ class LazySupervisedDataset(Dataset):
 
         data_dict["position_ids"] = position_ids
         data_dict["attention_mask"] = [seq_len]
-
-        text = self.processor.tokenizer.decode(
-            data_dict["input_ids"][0], skip_special_tokens=False
+        data_dict["active_sample_image_count"] = int(
+            torch.cat(grid_thw, dim=0).shape[0] if grid_thw else 0
         )
 
-        labels = data_dict["labels"][0]
-        labels = [
-            tid if tid != -100 else self.processor.tokenizer.pad_token_id
-            for tid in labels
-        ]
-        label = self.processor.tokenizer.decode(labels, skip_special_tokens=False)
+        latent_token_ids = getattr(self.data_args, "activeqwen_latent_token_ids", [])
+        active_token_mask = torch.zeros_like(data_dict["input_ids"], dtype=torch.bool)
+        for token_id in latent_token_ids:
+            active_token_mask |= data_dict["input_ids"] == token_id
+        data_dict["active_token_mask"] = active_token_mask
+
+        has_active_label = bool(
+            getattr(self.data_args, "activeqwen_enable", False)
+            and source.get("provide_latent", False)
+        )
+        data_dict["active_sample_has_label"] = has_active_label
+        if has_active_label:
+            latent_field = source.get("latent_field", "latents")
+            latent_files = _normalize_media_files(source.get(latent_field))
+            if not latent_files:
+                raise ValueError(f"Missing latent file for active sample: {source.get('id')}")
+            latent_root = source.get("latent_path")
+            if not latent_root:
+                raise ValueError(f"Missing latent_path for active sample: {source.get('id')}")
+            latent_tensor = load_active_embedding(Path(latent_root) / latent_files[0])
+            if data_dict["active_sample_image_count"] != latent_tensor.shape[0]:
+                raise ValueError(
+                    "Latent target views do not match sample image count: "
+                    f"{data_dict['active_sample_image_count']} vs {latent_tensor.shape[0]}"
+                )
+            data_dict["active_target_embeddings"] = latent_tensor
 
         return data_dict
 
     def _get_packed_item(self, sources) -> Dict[str, torch.Tensor]:
 
         if isinstance(sources, dict):
-            if isinstance(source, dict):
-                sources = [sources]
+            sources = [sources]
             assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
             return self._get_item(sources)
 
@@ -589,6 +741,11 @@ class LazySupervisedDataset(Dataset):
                         ),
                     }
                 )
+            new_data_dict = _append_active_fields_to_batch(
+                new_data_dict,
+                data_list,
+                flattened=True,
+            )
             return new_data_dict
 
 
@@ -673,7 +830,11 @@ class DataCollatorForSupervisedDataset(object):
         batch["pixel_values_videos"] = concat_videos
         batch["video_grid_thw"] = video_grid_thw
         batch["position_ids"] = position_ids
-        return batch
+        return _append_active_fields_to_batch(
+            batch,
+            instances,
+            flattened=False,
+        )
 
 
 @dataclass
@@ -746,8 +907,11 @@ class FlattenedDataCollatorForSupervisedDataset(DataCollatorForSupervisedDataset
         batch["image_grid_thw"] = grid_thw
         batch["pixel_values_videos"] = concat_videos
         batch["video_grid_thw"] = video_grid_thw
-
-        return batch
+        return _append_active_fields_to_batch(
+            batch,
+            instances,
+            flattened=True,
+        )
 
 
 def make_supervised_data_module(processor, data_args) -> Dict:

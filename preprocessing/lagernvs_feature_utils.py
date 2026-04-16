@@ -21,7 +21,23 @@ from tqdm import tqdm
 
 
 THIS_DIR = Path(__file__).resolve().parent
-LAGERNVS_ROOT = THIS_DIR / "lagernvs"
+
+
+def _resolve_lagernvs_root() -> Path:
+    candidates = [
+        THIS_DIR.parent / "lagernvs",  # new location: CameraVLM/lagernvs
+        THIS_DIR / "lagernvs",  # backward-compatible fallback
+    ]
+    for candidate in candidates:
+        if (candidate / "models" / "encoder_decoder.py").is_file():
+            return candidate
+    raise FileNotFoundError(
+        "Could not locate lagernvs source directory. Tried:\n"
+        + "\n".join(str(path) for path in candidates)
+    )
+
+
+LAGERNVS_ROOT = _resolve_lagernvs_root()
 DEFAULT_CAMERA_DATA_ROOT = Path(
     "/share/project/zhouenshen/sfs/dataset/ActivePerception/Pano/vlm_camera_dataset/camera_data"
 )

@@ -9,6 +9,12 @@ class ModelArguments:
     tune_mm_llm: bool = field(default=False)
     tune_mm_mlp: bool = field(default=False)
     tune_mm_vision: bool = field(default=False)
+    activeqwen_enable: bool = field(default=False)
+    tune_active_projector: bool = field(default=True)
+    activeqwen_latent_token_count: int = field(default=12)
+    activeqwen_projector_prompt_length: int = field(default=64)
+    activeqwen_target_dim: int = field(default=768)
+    activeqwen_projector_depth: int = field(default=2)
 
 @dataclass
 class DataArguments:
@@ -37,6 +43,9 @@ class TrainingArguments(transformers.TrainingArguments):
     )
     mm_projector_lr: Optional[float] = None
     vision_tower_lr: Optional[float] = None
+    active_projector_lr: Optional[float] = None
+    active_ce_loss_weight: float = field(default=1.0)
+    active_3d_loss_weight: float = field(default=1.0)
 
     ## Lora config
     lora_enable: bool = field(default=False)

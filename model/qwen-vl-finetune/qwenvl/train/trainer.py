@@ -1,3 +1,5 @@
+import os
+import time
 from typing import Dict, List, Optional, Sequence, Tuple, Callable
 
 import torch
@@ -28,6 +30,18 @@ from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
 from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
+ORIGINAL_TRAINER_COMPUTE_LOSS = Trainer.compute_loss
+ORIGINAL_TRAINER_LOG = Trainer.log
+
+
+def debug_timing_enabled() -> bool:
+    return os.environ.get("ACTIVEQWEN_DEBUG_TIMING", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def debug_log(message: str) -> None:
+    if debug_timing_enabled():
+        rank = os.environ.get("RANK", "?")
+        print(f"[trainer][rank{rank}] {message}", flush=True)
 
 
 def flash_attention_forward(
@@ -320,168 +334,169 @@ def create_optimizer(self):
     if self.optimizer is None:
         decay_parameters = self.get_decay_parameter_names(opt_model)
         decay_parameters = [name for name in decay_parameters if "bias" not in name]
+        named_parameters = []
+        seen_param_ids = set()
+        for name, param in opt_model.named_parameters():
+            if id(param) in seen_param_ids:
+                continue
+            seen_param_ids.add(id(param))
+            named_parameters.append((name, param))
+        projector_parameters = {
+            name for name, _ in named_parameters if "merger" in name
+        }
+        vision_tower_parameters = {
+            name for name, _ in named_parameters if "visual" in name
+        }
+        active_parameters = {
+            name for name, _ in named_parameters if "active_projector" in name
+        }
+
+        def collect_params(*, use_decay, include=None, exclude=None):
+            include = include or set()
+            exclude = exclude or set()
+            params = []
+            for name, param in named_parameters:
+                if not param.requires_grad:
+                    continue
+                if use_decay and name not in decay_parameters:
+                    continue
+                if not use_decay and name in decay_parameters:
+                    continue
+                if include and name not in include:
+                    continue
+                if name in exclude:
+                    continue
+                params.append(param)
+            return params
+
+        optimizer_grouped_parameters = []
+
+        special_exclusions = set()
         if self.args.mm_projector_lr is not None and self.args.mm_projector_lr != 0:
-            projector_parameters = [
-                name for name, _ in opt_model.named_parameters() if "merger" in name
-            ]
-            if self.args.vision_tower_lr is not None and self.args.vision_tower_lr != 0:
-                vision_tower_parameters = [
-                    name for name, _ in opt_model.named_parameters() if "visual" in name
-                ]
-                optimizer_grouped_parameters = [
-                    {
-                        "params": [
-                            p
-                            for n, p in opt_model.named_parameters()
-                            if (
-                                n in decay_parameters
-                                and n not in projector_parameters
-                                and n not in vision_tower_parameters
-                                and p.requires_grad
-                            )
-                        ],
-                        "weight_decay": self.args.weight_decay,
-                    },
-                    {
-                        "params": [
-                            p
-                            for n, p in opt_model.named_parameters()
-                            if (
-                                n in decay_parameters
-                                and n not in projector_parameters
-                                and n in vision_tower_parameters
-                                and p.requires_grad
-                            )
-                        ],
-                        "weight_decay": self.args.weight_decay,
-                        "lr": self.args.vision_tower_lr,
-                    },
-                    {
-                        "params": [
-                            p
-                            for n, p in opt_model.named_parameters()
-                            if (
-                                n not in decay_parameters
-                                and n not in projector_parameters
-                                and n not in vision_tower_parameters
-                                and p.requires_grad
-                            )
-                        ],
-                        "weight_decay": 0.0,
-                    },
-                    {
-                        "params": [
-                            p
-                            for n, p in opt_model.named_parameters()
-                            if (
-                                n not in decay_parameters
-                                and n not in projector_parameters
-                                and n in vision_tower_parameters
-                                and p.requires_grad
-                            )
-                        ],
-                        "weight_decay": 0.0,
-                        "lr": self.args.vision_tower_lr,
-                    },
-                    {
-                        "params": [
-                            p
-                            for n, p in opt_model.named_parameters()
-                            if (
-                                n in decay_parameters
-                                and n in projector_parameters
-                                and p.requires_grad
-                            )
-                        ],
-                        "weight_decay": self.args.weight_decay,
-                        "lr": self.args.mm_projector_lr,
-                    },
-                    {
-                        "params": [
-                            p
-                            for n, p in opt_model.named_parameters()
-                            if (
-                                n not in decay_parameters
-                                and n in projector_parameters
-                                and p.requires_grad
-                            )
-                        ],
-                        "weight_decay": 0.0,
-                        "lr": self.args.mm_projector_lr,
-                    },
-                ]
-            else:
-                optimizer_grouped_parameters = [
-                    {
-                        "params": [
-                            p
-                            for n, p in opt_model.named_parameters()
-                            if (
-                                n in decay_parameters
-                                and n not in projector_parameters
-                                and p.requires_grad
-                            )
-                        ],
-                        "weight_decay": self.args.weight_decay,
-                    },
-                    {
-                        "params": [
-                            p
-                            for n, p in opt_model.named_parameters()
-                            if (
-                                n not in decay_parameters
-                                and n not in projector_parameters
-                                and p.requires_grad
-                            )
-                        ],
-                        "weight_decay": 0.0,
-                    },
-                    {
-                        "params": [
-                            p
-                            for n, p in opt_model.named_parameters()
-                            if (
-                                n in decay_parameters
-                                and n in projector_parameters
-                                and p.requires_grad
-                            )
-                        ],
-                        "weight_decay": self.args.weight_decay,
-                        "lr": self.args.mm_projector_lr,
-                    },
-                    {
-                        "params": [
-                            p
-                            for n, p in opt_model.named_parameters()
-                            if (
-                                n not in decay_parameters
-                                and n in projector_parameters
-                                and p.requires_grad
-                            )
-                        ],
-                        "weight_decay": 0.0,
-                        "lr": self.args.mm_projector_lr,
-                    },
-                ]
-        else:
-            optimizer_grouped_parameters = [
+            special_exclusions.update(projector_parameters)
+        if self.args.vision_tower_lr is not None and self.args.vision_tower_lr != 0:
+            special_exclusions.update(vision_tower_parameters)
+        if self.args.active_projector_lr is not None and self.args.active_projector_lr != 0:
+            special_exclusions.update(active_parameters)
+
+        default_decay_params = collect_params(use_decay=True, exclude=special_exclusions)
+        default_nodecay_params = collect_params(use_decay=False, exclude=special_exclusions)
+        if default_decay_params:
+            optimizer_grouped_parameters.append(
                 {
-                    "params": [
-                        p
-                        for n, p in opt_model.named_parameters()
-                        if (n in decay_parameters and p.requires_grad)
-                    ],
+                    "params": default_decay_params,
                     "weight_decay": self.args.weight_decay,
-                },
+                }
+            )
+        if default_nodecay_params:
+            optimizer_grouped_parameters.append(
                 {
-                    "params": [
-                        p
-                        for n, p in opt_model.named_parameters()
-                        if (n not in decay_parameters and p.requires_grad)
-                    ],
+                    "params": default_nodecay_params,
                     "weight_decay": 0.0,
-                },
-            ]
+                }
+            )
+
+        if self.args.vision_tower_lr is not None and self.args.vision_tower_lr != 0:
+            vision_exclusions = set()
+            if self.args.mm_projector_lr is not None and self.args.mm_projector_lr != 0:
+                vision_exclusions.update(projector_parameters)
+            if self.args.active_projector_lr is not None and self.args.active_projector_lr != 0:
+                vision_exclusions.update(active_parameters)
+            vision_decay_params = collect_params(
+                use_decay=True,
+                include=vision_tower_parameters,
+                exclude=vision_exclusions,
+            )
+            vision_nodecay_params = collect_params(
+                use_decay=False,
+                include=vision_tower_parameters,
+                exclude=vision_exclusions,
+            )
+            if vision_decay_params:
+                optimizer_grouped_parameters.append(
+                    {
+                        "params": vision_decay_params,
+                        "weight_decay": self.args.weight_decay,
+                        "lr": self.args.vision_tower_lr,
+                    }
+                )
+            if vision_nodecay_params:
+                optimizer_grouped_parameters.append(
+                    {
+                        "params": vision_nodecay_params,
+                        "weight_decay": 0.0,
+                        "lr": self.args.vision_tower_lr,
+                    }
+                )
+
+        if self.args.mm_projector_lr is not None and self.args.mm_projector_lr != 0:
+            projector_decay_params = collect_params(
+                use_decay=True,
+                include=projector_parameters,
+                exclude=active_parameters,
+            )
+            projector_nodecay_params = collect_params(
+                use_decay=False,
+                include=projector_parameters,
+                exclude=active_parameters,
+            )
+            if projector_decay_params:
+                optimizer_grouped_parameters.append(
+                    {
+                        "params": projector_decay_params,
+                        "weight_decay": self.args.weight_decay,
+                        "lr": self.args.mm_projector_lr,
+                    }
+                )
+            if projector_nodecay_params:
+                optimizer_grouped_parameters.append(
+                    {
+                        "params": projector_nodecay_params,
+                        "weight_decay": 0.0,
+                        "lr": self.args.mm_projector_lr,
+                    }
+                )
+
+        if self.args.active_projector_lr is not None and self.args.active_projector_lr != 0:
+            active_decay_params = collect_params(
+                use_decay=True,
+                include=active_parameters,
+            )
+            active_nodecay_params = collect_params(
+                use_decay=False,
+                include=active_parameters,
+            )
+            if active_decay_params:
+                optimizer_grouped_parameters.append(
+                    {
+                        "params": active_decay_params,
+                        "weight_decay": self.args.weight_decay,
+                        "lr": self.args.active_projector_lr,
+                    }
+                )
+            if active_nodecay_params:
+                optimizer_grouped_parameters.append(
+                    {
+                        "params": active_nodecay_params,
+                        "weight_decay": 0.0,
+                        "lr": self.args.active_projector_lr,
+                    }
+                )
+
+        deduped_grouped_parameters = []
+        seen_param_ids = set()
+        for group in reversed(optimizer_grouped_parameters):
+            unique_params = []
+            for param in group["params"]:
+                if id(param) in seen_param_ids:
+                    continue
+                seen_param_ids.add(id(param))
+                unique_params.append(param)
+            if unique_params:
+                deduped_group = dict(group)
+                deduped_group["params"] = unique_params
+                deduped_grouped_parameters.append(deduped_group)
+        optimizer_grouped_parameters = list(reversed(deduped_grouped_parameters))
 
         optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(
             self.args
@@ -491,7 +506,93 @@ def create_optimizer(self):
     return self.optimizer
 
 
+def _loss_to_float(value):
+    if value is None:
+        return 0.0
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return 0.0
+        return value.detach().float().mean().item()
+    return float(value)
+
+
+def _get_output_value(outputs, key: str):
+    if outputs is None:
+        return None
+    if isinstance(outputs, dict):
+        return outputs.get(key)
+    return getattr(outputs, key, None)
+
+
+def _update_aux_loss_tracker(self, loss, outputs):
+    tracker = getattr(self, "_aux_loss_tracker", None)
+    if tracker is None:
+        tracker = {
+            "count": 0,
+            "total_loss": 0.0,
+            "ce_loss": 0.0,
+            "3d_loss": 0.0,
+        }
+
+    text_loss = _get_output_value(outputs, "text_loss")
+    active_3d_loss = _get_output_value(outputs, "active_3d_loss")
+
+    tracker["count"] += 1
+    tracker["total_loss"] += _loss_to_float(loss)
+    tracker["ce_loss"] += _loss_to_float(text_loss if text_loss is not None else loss)
+    tracker["3d_loss"] += _loss_to_float(active_3d_loss)
+    self._aux_loss_tracker = tracker
+
+
+def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+    start_time = time.perf_counter()
+    if debug_timing_enabled():
+        batch_shape = tuple(inputs["input_ids"].shape) if "input_ids" in inputs else None
+        debug_log(f"compute_loss start batch_shape={batch_shape}")
+
+    loss, outputs = ORIGINAL_TRAINER_COMPUTE_LOSS(
+        self,
+        model,
+        inputs,
+        return_outputs=True,
+        num_items_in_batch=num_items_in_batch,
+    )
+    debug_log(f"compute_loss forward_done elapsed={time.perf_counter() - start_time:.2f}s")
+
+    if model.training:
+        _update_aux_loss_tracker(self, loss, outputs)
+
+    if return_outputs:
+        return loss, outputs
+    return loss
+
+
+def log(self, logs, *args, **kwargs):
+    if (
+        isinstance(logs, dict)
+        and not any(key.startswith("eval_") for key in logs.keys())
+        and ("loss" in logs or "train_loss" in logs)
+    ):
+        tracker = getattr(self, "_aux_loss_tracker", None)
+        if tracker is not None and tracker["count"] > 0:
+            logs = dict(logs)
+            count = tracker["count"]
+            logs["total_loss"] = tracker["total_loss"] / count
+            logs["ce_loss"] = tracker["ce_loss"] / count
+            logs["3d_loss"] = tracker["3d_loss"] / count
+            self._aux_loss_tracker = {
+                "count": 0,
+                "total_loss": 0.0,
+                "ce_loss": 0.0,
+                "3d_loss": 0.0,
+            }
+
+    return ORIGINAL_TRAINER_LOG(self, logs, *args, **kwargs)
+
+
 # Apply monkey patches
+Trainer.compute_loss = compute_loss
+Trainer.log = log
 Trainer.create_optimizer = create_optimizer
 
 Qwen2VisionTransformerPretrainedModel.print_trainable_parameters = (
